@@ -7,6 +7,7 @@ from pathlib import Path
 from nydus_image import NydusBackend, NydusS3Backend, NydusLocalFilesystemBackend, NydusImageWithBackends, NydusBlobLocation, change_backends, read_from_dir, write_to_dir
 from manifest import download_bootstrap_and_manifest, upload_bootstrap_and_manifest
 from copier import copy_blobs
+from repacker import repack_image
 
 class BackendArguments:
     def __init__(self, prefix: str) -> None:
@@ -68,7 +69,7 @@ class CopyCommand:
         source_group.add_argument("--source-oci-reference",
                                 help="Source OCI reference (e.g., registry.example.com/repo:tag)")
         source_group.add_argument("--source-oci-dir",
-                                help="Source directory containing bootstrap and config.json")
+                                help="Source directory containing `bootstrap` and `config.json`. The config.json should have keys `architecture` (eg amd64) and `os` (eg linux). Then, there can be a `config` object which in turn has eg \"Cmd\": [ \"/bin/sh\" ] . TODO at some point we should make this file optional to make it easier to upload an OCI image from a local nydus-image output.")
 
         # Target options (mutually exclusive)
         target_group = parser.add_mutually_exclusive_group(required=True)
@@ -133,6 +134,99 @@ class CopyCommand:
             _LOGGER.info("Copy operation completed successfully")
 
 
+class RepackCommand:
+    """Command to repack nydus images by downloading, unpacking to tar, and repacking them."""
+
+    def __init__(self):
+        self.source_backend_args = BackendArguments("source")
+        self.target_backend_args = BackendArguments("target")
+
+    def add_arguments(self, parser: ArgumentParser) -> None:
+        """Add command-line arguments for the repack command."""
+        # Source options (mutually exclusive)
+        source_group = parser.add_mutually_exclusive_group(required=True)
+        source_group.add_argument("--source-oci-reference",
+                                help="Source OCI reference (e.g., registry.example.com/repo:tag)")
+        source_group.add_argument("--source-oci-dir",
+                                help="Source directory containing `bootstrap` and `config.json`")
+
+        # Target options (mutually exclusive)
+        target_group = parser.add_mutually_exclusive_group(required=True)
+        target_group.add_argument("--target-oci-reference",
+                                help="Target OCI reference (e.g., registry.example.com/repo:tag)")
+        target_group.add_argument("--target-oci-dir",
+                                help="Target directory to write bootstrap and config.json")
+
+        # Add source backend arguments
+        self.source_backend_args.add_arguments(parser)
+
+        # Add target backend arguments
+        self.target_backend_args.add_arguments(parser)
+
+        # Add nydus-image create options
+        parser.add_argument("--nydus-image-create-opts", default="",
+                          help="Additional options to pass to nydus-image create command")
+
+    def run(self, args: Namespace) -> None:
+        """Execute the repack command."""
+        logging.basicConfig(level=logging.INFO)
+        _LOGGER = logging.getLogger(__name__)
+
+        # Parse source and target backends
+        source_backend = self.source_backend_args.parse_arguments(args)
+        target_backend = self.target_backend_args.parse_arguments(args)
+
+        # Create temporary directory for the entire operation
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+
+            # Create subdirectories for different stages
+            download_dir = temp_path / "download"
+            download_dir.mkdir(parents=True)
+
+            # Step 1: Download source image
+            if args.source_oci_reference:
+                _LOGGER.info(f"Downloading from source OCI reference: {args.source_oci_reference}")
+                source_image = download_bootstrap_and_manifest(
+                    reference=args.source_oci_reference,
+                    backend=source_backend,
+                    output_dir=download_dir
+                )
+            elif args.source_oci_dir:
+                _LOGGER.info(f"Reading from source directory: {args.source_oci_dir}")
+                source_image = read_from_dir(
+                    directory=Path(args.source_oci_dir),
+                    backend=source_backend
+                )
+            else:
+                raise ValueError("Either --source-oci-reference or --source-oci-dir must be specified")
+
+            # Step 2: Repack the image
+            _LOGGER.info("Starting repack operation")
+            repacked_image, temp_source_image = repack_image(
+                source_image=source_image,
+                target_backend=target_backend,
+                create_opts=args.nydus_image_create_opts,
+                temp_dir=temp_path
+            )
+
+            # Step 3: Copy generated blobs to target backend using generic copy_blobs
+            _LOGGER.info("Copying generated blobs to target backend")
+            copy_blobs(temp_source_image, repacked_image)
+
+            # Step 4: Upload/save target image
+            if args.target_oci_reference:
+                _LOGGER.info(f"Uploading to target OCI reference: {args.target_oci_reference}")
+                upload_bootstrap_and_manifest(repacked_image, args.target_oci_reference)
+            elif args.target_oci_dir:
+                _LOGGER.info(f"Writing to target directory: {args.target_oci_dir}")
+                write_to_dir(repacked_image, Path(args.target_oci_dir))
+            else:
+                raise ValueError("Either --target-oci-reference or --target-oci-dir must be specified")
+
+            _LOGGER.info("Repack operation completed successfully")
+
+
 if __name__ == "__main__":
     parser = ArgumentParser(description="Nydusify2 - Convert and copy nydus images")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
@@ -142,6 +236,12 @@ if __name__ == "__main__":
     copy_parser = subparsers.add_parser("copy", help="Copy nydus image between different backends")
     copy_command.add_arguments(copy_parser)
     copy_parser.set_defaults(func=copy_command.run)
+
+    # Repack subcommand
+    repack_command = RepackCommand()
+    repack_parser = subparsers.add_parser("repack", help="Repack nydus image by unpacking and repacking it")
+    repack_command.add_arguments(repack_parser)
+    repack_parser.set_defaults(func=repack_command.run)
 
     args = parser.parse_args()
 
