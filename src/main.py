@@ -29,11 +29,15 @@ class BackendArguments:
                 # Expected keys for NydusS3Backend
                 expected_keys = {'endpoint', 'bucket', 'region', 'object_prefix', 'access_key', 'secret_key'}
 
-                # Handle bucket_name alias
+                # Handle key aliases
                 if 'bucket_name' in config:
                     config['bucket'] = config.pop('bucket_name')
+                if 'access_key_id' in config:
+                    config['access_key'] = config.pop('access_key_id')
+                if 'access_key_secret' in config:
+                    config['secret_key'] = config.pop('access_key_secret')
 
-                # Check for excess keys
+                # Check for excess keys (after alias handling)
                 excess_keys = set(config.keys()) - expected_keys
                 if excess_keys:
                     warnings.warn(f"Unknown keys in S3 config file: {', '.join(excess_keys)}")
@@ -88,44 +92,45 @@ class CopyCommand:
         source_backend = self.source_backend_args.parse_arguments(args)
         target_backend = self.target_backend_args.parse_arguments(args)
 
-        # Load source image
-        if args.source_oci_reference:
-            _LOGGER.info(f"Downloading from source OCI reference: {args.source_oci_reference}")
-            # Create temporary directory for bootstrap
-            with tempfile.TemporaryDirectory() as temp_dir:
-                temp_path = Path(temp_dir)
+        # Create temporary directory for bootstrap that persists through the entire operation
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+
+            # Load source image
+            if args.source_oci_reference:
+                _LOGGER.info(f"Downloading from source OCI reference: {args.source_oci_reference}")
                 source_image = download_bootstrap_and_manifest(
                     reference=args.source_oci_reference,
                     backend=source_backend,
                     output_dir=temp_path
                 )
-        elif args.source_oci_dir:
-            _LOGGER.info(f"Reading from source directory: {args.source_oci_dir}")
-            source_image = read_from_dir(
-                directory=Path(args.source_oci_dir),
-                backend=source_backend
-            )
-        else:
-            raise ValueError("Either --source-oci-reference or --source-oci-dir must be specified")
+            elif args.source_oci_dir:
+                _LOGGER.info(f"Reading from source directory: {args.source_oci_dir}")
+                source_image = read_from_dir(
+                    directory=Path(args.source_oci_dir),
+                    backend=source_backend
+                )
+            else:
+                raise ValueError("Either --source-oci-reference or --source-oci-dir must be specified")
 
-        # Create target image with different backends
-        target_image = change_backends(source_image, target_backend)
+            # Create target image with different backends
+            target_image = change_backends(source_image, target_backend)
 
-        # Copy blobs from source to target backend
-        _LOGGER.info("Copying blobs between backends")
-        copy_blobs(source_image, target_image)
+            # Copy blobs from source to target backend
+            _LOGGER.info("Copying blobs between backends")
+            copy_blobs(source_image, target_image)
 
-        # Save target image
-        if args.target_oci_reference:
-            _LOGGER.info(f"Uploading to target OCI reference: {args.target_oci_reference}")
-            upload_bootstrap_and_manifest(target_image, args.target_oci_reference)
-        elif args.target_oci_dir:
-            _LOGGER.info(f"Writing to target directory: {args.target_oci_dir}")
-            write_to_dir(target_image, Path(args.target_oci_dir))
-        else:
-            raise ValueError("Either --target-oci-reference or --target-oci-dir must be specified")
+            # Save target image
+            if args.target_oci_reference:
+                _LOGGER.info(f"Uploading to target OCI reference: {args.target_oci_reference}")
+                upload_bootstrap_and_manifest(target_image, args.target_oci_reference)
+            elif args.target_oci_dir:
+                _LOGGER.info(f"Writing to target directory: {args.target_oci_dir}")
+                write_to_dir(target_image, Path(args.target_oci_dir))
+            else:
+                raise ValueError("Either --target-oci-reference or --target-oci-dir must be specified")
 
-        _LOGGER.info("Copy operation completed successfully")
+            _LOGGER.info("Copy operation completed successfully")
 
 
 if __name__ == "__main__":

@@ -45,9 +45,11 @@ class RcloneConfig:
         """Given a filename, produce a full string suitable for use as an rclone CLI source or target"""
         match self.backend:
             case NydusS3Backend():
-                return f"{self.name}:{self.backend.object_prefix}{digest}"
+                # Include bucket name in the path for S3
+                return f"{self.name}:{self.backend.bucket}/{self.backend.object_prefix}{digest}"
             case NydusLocalFilesystemBackend():
-                return str(self.backend.blob_dir / digest)
+                # For local filesystem, rclone copy expects a directory, not full file path
+                return str(self.backend.blob_dir)
             case _:
                 raise ValueError(f"Unknown backend type: {type(self.backend)}")
 
@@ -71,5 +73,23 @@ class RcloneConfig:
 
 def rclone_copy(digest: str, source_config: RcloneConfig, target_config: RcloneConfig) -> None:
     assert source_config.name != target_config.name, "can't copy between rclone configs with the same name"
-    env = {**source_config.env(), **target_config.env()}
-    subprocess.run(["rclone", "copy", source_config.with_digest(digest), target_config.with_digest(digest)], check=True, env=env)
+    import os
+    import logging
+    _LOGGER = logging.getLogger(__name__)
+
+    env = {**os.environ, **source_config.env(), **target_config.env()}
+    source_path = source_config.with_digest(digest)
+    target_path = target_config.with_digest(digest)
+
+    _LOGGER.info(f"Running rclone copy from {source_path} to {target_path}")
+
+    try:
+        result = subprocess.run([
+            "rclone", "copy", source_path, target_path
+        ], check=True, env=env, capture_output=True, text=True)
+        _LOGGER.info("rclone copy completed successfully")
+    except subprocess.CalledProcessError as e:
+        _LOGGER.error(f"rclone copy failed with exit code {e.returncode}")
+        _LOGGER.error(f"rclone stdout: {e.stdout}")
+        _LOGGER.error(f"rclone stderr: {e.stderr}")
+        raise

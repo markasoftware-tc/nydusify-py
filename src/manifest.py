@@ -133,9 +133,21 @@ def download_bootstrap_and_manifest(reference: str, backend: NydusBackend, outpu
     with tempfile.NamedTemporaryFile(mode='w+', suffix=".json") as manifest_file:
         manifest_path = Path(manifest_file.name)
 
-        result = subprocess.run([
-            "regctl", "manifest", "get", reference
-        ], capture_output=True, text=True, check=True)
+        try:
+            result = subprocess.run([
+                "regctl", "manifest", "get", "--format", "raw-body", reference
+            ], capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError as e:
+            _LOGGER.error(f"Failed to download manifest from {reference}")
+            _LOGGER.error(f"regctl stdout: {e.stdout}")
+            _LOGGER.error(f"regctl stderr: {e.stderr}")
+            raise
+
+        _LOGGER.debug(f"regctl stdout: '{result.stdout}'")
+        _LOGGER.debug(f"regctl stderr: '{result.stderr}'")
+
+        if not result.stdout.strip():
+            raise ValueError(f"regctl returned empty output for manifest {reference}")
 
         manifest_data = json.loads(result.stdout)
         _LOGGER.debug(f"Downloaded manifest: {manifest_data}")
@@ -144,16 +156,21 @@ def download_bootstrap_and_manifest(reference: str, backend: NydusBackend, outpu
         if manifest_data.get("schemaVersion") != 2:
             raise ValueError(f"Unsupported manifest schema version: {manifest_data.get('schemaVersion')}")
 
-        expected_manifest_media_type = "application/vnd.docker.distribution.manifest.v2+json"
-        if manifest_data.get("mediaType") != expected_manifest_media_type:
-            raise ValueError(f"Unexpected manifest media type: {manifest_data.get('mediaType')}, expected: {expected_manifest_media_type}")
+        # Accept both Docker and OCI manifest formats
+        accepted_manifest_media_types = [
+            "application/vnd.docker.distribution.manifest.v2+json",
+            "application/vnd.oci.image.manifest.v1+json"
+        ]
+        manifest_media_type = manifest_data.get("mediaType")
+        if manifest_media_type not in accepted_manifest_media_types:
+            raise ValueError(f"Unexpected manifest media type: {manifest_media_type}, expected one of: {accepted_manifest_media_types}")
 
         # Validate config section
         config_section = manifest_data.get("config")
         if not config_section:
             raise ValueError("No config section found in manifest")
 
-        expected_config_media_type = "application/vnd.docker.container.image.v1+json"
+        expected_config_media_type = "application/vnd.oci.image.config.v1+json"
         if config_section.get("mediaType") != expected_config_media_type:
             raise ValueError(f"Unexpected config media type: {config_section.get('mediaType')}, expected: {expected_config_media_type}")
 
@@ -203,9 +220,16 @@ def download_bootstrap_and_manifest(reference: str, backend: NydusBackend, outpu
             with tempfile.NamedTemporaryFile(suffix=".tar.gz") as temp_tar:
                 temp_tar_path = Path(temp_tar.name)
 
-                subprocess.run([
-                    "regctl", "blob", "get", reference, bootstrap_digest, str(temp_tar_path)
-                ], capture_output=True, text=True, check=True)
+                try:
+                    with open(temp_tar_path, 'wb') as f:
+                        subprocess.run([
+                            "regctl", "blob", "get", reference, bootstrap_digest
+                        ], stdout=f, stderr=subprocess.PIPE, check=True)
+                except subprocess.CalledProcessError as e:
+                    _LOGGER.error(f"Failed to download bootstrap blob {bootstrap_digest}")
+                    _LOGGER.error(f"regctl stdout: {e.stdout}")
+                    _LOGGER.error(f"regctl stderr: {e.stderr}")
+                    raise
 
                 # Extract the bootstrap from the tarball
                 bootstrap_path = output_dir / "image.boot"
